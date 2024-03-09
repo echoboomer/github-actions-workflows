@@ -1,0 +1,108 @@
+name: Docker Build (w/ Trivy Scan)
+on:
+  workflow_call:
+    inputs:
+      build_context:
+        description: 'The build context. Will default to ., but can be overridden.'
+        required: false
+        type: string
+      dockerfile_path:
+        description: 'The full path to the Dockerfile. Will default to Dockerfile at root, but can be overridden.'
+        required: false
+        type: string
+      image_name:
+        description: 'The full name for the Docker image. For example: myrepo/myimage'
+        required: true
+        type: string
+      image_tag:
+        description: 'The image tag. If not provided, it will be the git commit SHA.'
+        required: false
+        type: string
+      severity:
+        description: 'The severity restrictions to enforce for Trivy scans. Should be a comma-separated string. Will default to CRITICAL,HIGH.'
+        required: false
+        type: string
+env:
+  benchmark: docker-cis
+  trivy_version: 0.48.3
+jobs:
+  docker_build:
+    name: Build & Scan ${{ inputs.image_name }}:${{ inputs.image_tag || github.sha }} Image
+    runs-on: ubuntu-22.04
+    env:
+      full_image_path: '${{ inputs.image_name }}:${{ inputs.image_tag || github.sha }}'
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Trivy
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin v${{ env.trivy_version }}
+      - name: Build Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          push: false
+          context: ${{ inputs.build_context || '.' }}
+          file: ${{ inputs.dockerfile_path || 'Dockerfile' }}
+          tags: ${{ env.full_image_path }}
+          build-args: ${{ secrets.build-args }}
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          exit-code: '1'
+          format: 'table'
+          ignore-unfixed: true
+          image-ref: '${{ env.full_image_path }}'
+          severity: "${{ inputs.severity || 'CRITICAL,HIGH' }}"
+          vuln-type: 'os,library'
+      - name: Run Trivy Compliance Report
+        id: report
+        run: |
+          {
+            echo 'REPORT<<EOF'
+            trivy --quiet image --compliance ${{ env.benchmark }} ${{ env.full_image_path }} >> $GITHUB_OUTPUT
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // 1. Retrieve existing bot comments for the PR
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            })
+            const botComment = comments.find(comment => {
+              return comment.user.type === 'Bot' && comment.body.includes('Trivy Compliance Report for ${{ env.full_image_path }}')
+            })
+
+            // 2. Prepare format of the comment
+            const output = `#### Trivy Compliance Report for ${{ env.full_image_path }} 🔐
+            <details open><summary>${{ env.benchmark }}</summary>
+
+            \`\`\`\n
+            ${{ steps.report.outputs.REPORT }}
+            \`\`\`
+
+            </details>`;
+
+            // 3. If we have a comment, update it, otherwise create a new one
+            if (botComment) {
+              github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              })
+            } else {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              })
+            }

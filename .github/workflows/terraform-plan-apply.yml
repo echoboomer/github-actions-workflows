@@ -1,0 +1,274 @@
+name: Plan & Apply
+on:
+  workflow_call:
+    inputs:
+      assume_role:
+        description: 'The AWS role to assume when running.'
+        required: true
+        type: string
+      aws_region:
+        description: 'The AWS region.'
+        required: true
+        type: string
+      disable_apply:
+        description: 'Whether or not to disable the apply step where it would otherwise be run.'
+        required: false
+        type: boolean
+      environment:
+        description: 'Environment the code is running in.'
+        required: true
+        type: string
+      terraform_directory:
+        description: 'The directory in which target terraform code resides.'
+        required: true
+        type: string
+      secrets_manager_secret_name:
+        description: 'Whether or not to set environment variables from an AWS Secrets Manager secret.'
+        required: false
+        type: string
+      use_secrets_manager_secret:
+        description: 'The name of the AWS Secrets Manager secret. Its values will be parsed as JSON and set as environment variables.'
+        required: false
+        type: boolean
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.terraform_directory }}
+    outputs:
+      files_changed: ${{ steps.check-for-changed-files.outputs.tf_any_changed }}
+      directory_name_normalized: ${{ steps.normalize-directory-name.outputs.result }}
+      terraform_plan_exit_code: ${{ steps.plan.outputs.exitcode }}
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Normalize Directory Name
+        id: normalize-directory-name
+        run: |
+          export normalized=$(echo ${{ inputs.terraform_directory}} | sed 's#/#\_#g')
+          echo "result=$normalized" >> "$GITHUB_OUTPUT"
+          echo "Normalized Terraform directory name to: $normalized"
+      - name: Check For Changed Terraform Files
+        id: check-for-changed-files
+        uses: tj-actions/changed-files@v42
+        with:
+          files_yaml: |
+            tf:
+              - ${{ inputs.terraform_directory }}/**
+      - name: Explain
+        if: ${{ steps.check-for-changed-files.outputs.tf_any_changed == 'false' }}
+        run: |
+          echo "🚫 No files were changed for ${{ inputs.terraform_directory }} - skipping remaining actions."
+      - name: Configure AWS Credentials
+        if: ${{ steps.check-for-changed-files.outputs.tf_any_changed == 'true' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ inputs.assume_role }}
+          role-external-id: terraform-service-account
+          role-duration-seconds: 1200
+          role-session-name: terraform-service-account
+      - name: Get AWS Secrets Manager Secrets
+        if: ${{ (inputs.use_secrets_manager_secret == true || inputs.use_secrets_manager_secret == 'true') && steps.check-for-changed-files.outputs.tf_any_changed == 'true' }}
+        uses: aws-actions/aws-secretsmanager-get-secrets@v2
+        with:
+          secret-ids: |
+            ${{ inputs.secrets_manager_secret_name }}
+          parse-json-secrets: true
+      - name: Remove prefix from AWS Secrets Mananager secret environment variables
+        if: ${{ (inputs.use_secrets_manager_secret == true || inputs.use_secrets_manager_secret == 'true') && steps.check-for-changed-files.outputs.tf_any_changed == 'true' }}
+        run: |
+          SECRET_NAME=${{ inputs.secrets_manager_secret_name }}
+          PREFIX=$(echo $SECRET_NAME | tr '[a-z]' '[A-Z]' | tr /- _)_
+          echo "Secret name: ${SECRET_NAME}"
+          echo "Prefix: ${PREFIX}"
+          for v in $(env | grep $PREFIX); do
+            ACTUAL=$(echo $v | sed -e "s/^$PREFIX//")
+            VAR_NAME=$(echo $ACTUAL | cut -d= -f1)
+            VAR_VALUE=$(echo $ACTUAL | cut -d= -f2)
+            echo "Removed prefix, result: ${VAR_NAME}"
+            echo "$VAR_NAME=$VAR_VALUE" >> $GITHUB_ENV
+          done
+      - uses: hashicorp/setup-terraform@v3
+        if: ${{ steps.check-for-changed-files.outputs.tf_any_changed == 'true' }}
+        with:
+          terraform_version: 1.7.1
+      - name: Terraform fmt
+        if: ${{ steps.check-for-changed-files.outputs.tf_any_changed == 'true' }}
+        id: fmt
+        run: terraform fmt -check
+        continue-on-error: true
+      - name: Terraform Init
+        if: ${{ steps.check-for-changed-files.outputs.tf_any_changed == 'true' }}
+        id: init
+        run: terraform init
+      - name: Terraform Validate
+        if: ${{ steps.check-for-changed-files.outputs.tf_any_changed == 'true' }}
+        id: validate
+        run: terraform validate -no-color
+      - name: Terraform Plan
+        if: ${{ steps.check-for-changed-files.outputs.tf_any_changed == 'true' }}
+        id: plan
+        env:
+          TF_IN_AUTOMATION: true
+        run: |
+          terraform plan -no-color -out tfplan_${{ steps.normalize-directory-name.outputs.result }} -detailed-exitcode
+        continue-on-error: true
+      - name: Publish Terraform Plan
+        if: ${{ steps.check-for-changed-files.outputs.tf_any_changed == 'true' }}
+        id: publish-terraform-plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan_${{ steps.normalize-directory-name.outputs.result }}
+          path: ${{ inputs.terraform_directory }}/tfplan_${{ steps.normalize-directory-name.outputs.result }}
+      - uses: actions/github-script@v7
+        if: ${{ github.event_name == 'pull_request' && steps.check-for-changed-files.outputs.tf_any_changed == 'true' }}
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // 1. Retrieve existing bot comments for the PR
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            })
+            const botComment = comments.find(comment => {
+              return comment.user.type === 'Bot' && comment.body.includes('Terraform Format and Style - 📁 ${{ inputs.terraform_directory }}')
+            })
+
+            // 2. Prepare format of the comment
+            const output = `#### Terraform Format and Style - 📁 ${{ inputs.terraform_directory }} 🖌 \`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            <details><summary>Validation Output</summary>
+
+            \`\`\`\n
+            ${{ steps.validate.outputs.stdout }}
+            \`\`\`
+
+            </details>
+
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ inputs.terraform_directory }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+            // 3. If we have a comment, update it, otherwise create a new one
+            if (botComment) {
+              github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: output
+              })
+            } else {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              })
+            }
+  apply:
+    needs: plan
+    if: ${{ github.event.pull_request.merged == true && needs.plan.outputs.terraform_plan_exit_code == 2 && inputs.disable_apply == false }}
+    environment: terraform-${{ inputs.environment }}
+    env:
+      TF_IN_AUTOMATION: true
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.terraform_directory }}
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ inputs.aws_region }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: ${{ inputs.assume_role }}
+          role-external-id: terraform-service-account
+          role-duration-seconds: 1200
+          role-session-name: terraform-service-account
+      - name: Get AWS Secrets Manager Secrets
+        if: ${{ inputs.use_secrets_manager_secret == true || inputs.use_secrets_manager_secret == 'true' }}
+        uses: aws-actions/aws-secretsmanager-get-secrets@v2
+        with:
+          secret-ids: |
+            ${{ inputs.secrets_manager_secret_name }}
+          parse-json-secrets: true
+      - name: Remove prefix from AWS Secrets Mananager secret environment variables
+        if: ${{ inputs.use_secrets_manager_secret == true || inputs.use_secrets_manager_secret == 'true' }}
+        run: |
+          SECRET_NAME=${{ inputs.secrets_manager_secret_name }}
+          PREFIX=$(echo $SECRET_NAME | tr '[a-z]' '[A-Z]' | tr /- _)_
+          echo "Secret name: ${SECRET_NAME}"
+          echo "Prefix: ${PREFIX}"
+          for v in $(env | grep $PREFIX); do
+            ACTUAL=$(echo $v | sed -e "s/^$PREFIX//")
+            VAR_NAME=$(echo $ACTUAL | cut -d= -f1)
+            VAR_VALUE=$(echo $ACTUAL | cut -d= -f2)
+            echo "Removed prefix, result: ${VAR_NAME}"
+            echo "$VAR_NAME=$VAR_VALUE" >> $GITHUB_ENV
+          done
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.1
+      - name: Terraform Init
+        id: init
+        run: terraform init
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan_${{ needs.plan.outputs.directory_name_normalized }}
+          path: ${{ inputs.terraform_directory }}/
+      - name: debug
+        run: |
+          pwd
+          ls -al
+      - name: Terraform Apply
+        id: apply
+        run: terraform apply -auto-approve -no-color tfplan_${{ needs.plan.outputs.directory_name_normalized }}
+      - uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            // 1. Prepare format of the comment
+            const output = `#### Terraform Apply - 📁 ${{ inputs.terraform_directory }}
+
+            <details><summary>Apply Output</summary>
+
+            \`\`\`\n
+            ${{ steps.apply.outputs.stdout }}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \`${{ inputs.terraform_directory }}\`, Workflow: \`${{ github.workflow }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })

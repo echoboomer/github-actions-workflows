@@ -1,0 +1,129 @@
+name: 'Helm Test & Package'
+on:
+  workflow_call:
+    inputs:
+      chart_repository:
+        description: 'The URL of the Helm chart repository to push charts to.'
+        required: false
+        type: string
+      chart_repository_name:
+        description: 'The name of the Helm chart repository.'
+        required: false
+        type: string
+    secrets:
+      chartmuseum_password:
+        description: 'Password for the chartmuseum instance.'
+        required: true
+      chartmuseum_username:
+        description: 'Username for the chartmuseum instance.'
+        required: true
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: v3.13.1
+      - name: Package
+        run: |
+          #!/bin/bash
+          set -euo pipefail
+          cNone='\033[00m'
+          cRed='\033[01;31m'
+          cGreen='\033[01;32m'
+
+          # Directory for chart source.
+          cd charts
+
+          # Add repositories used centrally.
+          helm repo add bitnami https://charts.bitnami.com/bitnami
+
+          # Lint all charts and add dependencies if there are any.
+          echo -e "${cGreen}[!] Linting charts...${cNone}"
+          echo
+          for f in $(ls .); do
+            echo -e "${cGreen}[!] Building dependencies for ${f}...${cNone}"
+            helm dependency build ${f}
+            echo
+            echo -e "${cGreen}[!] Linting ${f}...${cNone}"
+            helm lint ${f}
+            echo
+          done
+          echo
+  bats-tests:
+    needs:
+      - lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup BATS
+        uses: mig4/setup-bats@v1
+        with:
+          bats-version: 1.10.0
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Test
+        run: bats -r .
+  package:
+    needs:
+      - lint
+      - bats-tests
+    runs-on: ubuntu-latest
+    container:
+      image: eb129/docker-kubectl:v1.2.0
+      env:
+        CHART_REPOSITORY_URL: ${{ inputs.chart_repository }}
+        CHART_REPOSITORY_NAME: ${{ inputs.chart_repository_name }}
+        HELM_REPO_USER: ${{ secrets.chartmuseum_username }}
+        HELM_REPO_PASS: ${{ secrets.chartmuseum_password }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Package
+        run: |
+          #!/bin/bash
+          set -euo pipefail
+          cNone='\033[00m'
+          cRed='\033[01;31m'
+          cGreen='\033[01;32m'
+
+          # Directory for chart source.
+          cd charts
+
+          # Enable helm cm-push.
+          helm plugin install https://github.com/chartmuseum/helm-push.git
+          echo
+
+          echo -e "${cGreen}[!] Analyzing and packaging Helm charts..."
+
+          echo -e "${cGreen}[!] Adding Helm repository...${cNone}"
+
+          # Add repo.
+          helm repo add $CHART_REPOSITORY_NAME $CHART_REPOSITORY_URL --username "$HELM_REPO_USER" --password "$HELM_REPO_PASS"
+          echo
+          helm repo update
+          echo
+
+          # Package preview chart version on branch.
+          if [ "$GITHUB_REF_NAME" != "main" ]; then
+            for f in $(ls .); do
+              echo -e "${cGreen}[!] Packaging preview version of $f...${cNone}"
+              helm cm-push "$f" --force --version="$(helm show chart $f | grep '^version' | sed 's/^version: //')-preview-${GITHUB_SHA: -8}" "$CHART_REPOSITORY_NAME"
+            done
+            echo
+          fi
+
+          # Package on merge.
+          if [ "$GITHUB_REF_NAME" = "main" ]; then
+            for f in $(ls .); do
+              echo -e "${cGreen}[!] Packaging $f...${cNone}"
+              helm cm-push "$f" --force $CHART_REPOSITORY_NAME
+            done
+            echo
+          fi
